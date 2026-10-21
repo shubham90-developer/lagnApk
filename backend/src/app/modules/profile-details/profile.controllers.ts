@@ -14,11 +14,18 @@ import { sendNotification } from '../../services/sendNotification.service';
 import { ContactView } from './contact-view/contactView.model';
 import { checkContactViewLimit } from './contact-view/contactView.limit.service';
 import { Spotlight } from './spotlight/spotlight.model';
+import { cloudinary } from '../../config/cloudinary';
+
+import ProfileVisit from './profile-visits/profileVisits.model';
+import { ProfileReport } from './report-profile/reportProfile.model';
+import { ProfileVerification } from './profile-verification/profileVerification.model';
+
+import { AppReview } from '../appReview/reviewModel';
+import { AdminNotification } from '../admin/admin-notification/adminNotification.model';
 import {
   calculateMatchPercentage,
   attachMatchPercentages,
 } from '../../services/matchProfileService';
-// import { generateMatrimonyId } from "../../utils/counter/counter.service";
 
 export const generateMatrimonyId = (
   firstName: string,
@@ -977,22 +984,18 @@ export const getProfileById = async (req: Request, res: Response) => {
   }
 };
 
+// Converts a Cloudinary URL into its public_id
+const getCloudinaryPublicId = (url: string): string | null => {
+  const match = url.match(/\/upload\/(?:v\d+\/)?(.+)\.[a-zA-Z0-9]+$/);
+  return match ? match[1] : null;
+};
+
 export const deleteProfile = async (req: Request, res: Response) => {
   try {
-    const profile = await Profile.findOneAndUpdate(
-      {
-        userId: req.user.id,
-        isDeleted: false,
-      },
-
-      {
-        isDeleted: true,
-      },
-
-      {
-        new: true,
-      },
-    );
+    const profile = await Profile.findOne({
+      userId: req.user.id,
+      isDeleted: false,
+    });
 
     if (!profile) {
       return res.status(404).json({
@@ -1001,18 +1004,97 @@ export const deleteProfile = async (req: Request, res: Response) => {
       });
     }
 
+    const profileId = profile._id;
+
+    // Read image URLs before the records holding them are deleted
+    const verifications = await ProfileVerification.find({ profileId }).lean();
+    const imageUrls = [
+      ...(profile.photos ?? []),
+      ...verifications.flatMap((v) => [v.selfieUrl, v.adhaarFrontUrl]),
+    ].filter(Boolean) as string[];
+
+    const session = await mongoose.startSession();
+    try {
+      session.startTransaction();
+
+      // Profile-owned data
+      await PartnerPreference.deleteMany({ profileId }, { session });
+      await ProfileVerification.deleteMany({ profileId }, { session });
+      await Spotlight.deleteMany({ profileId }, { session });
+      await AppReview.deleteMany({ profileId }, { session });
+      await AdminNotification.deleteMany({ profileId }, { session });
+
+      // Connections where the profile is on either side
+      await Interest.deleteMany(
+        { $or: [{ senderId: profileId }, { receiverId: profileId }] },
+        { session },
+      );
+      await Block.deleteMany(
+        { $or: [{ userId: profileId }, { blockedUserId: profileId }] },
+        { session },
+      );
+      await Ignore.deleteMany(
+        { $or: [{ userId: profileId }, { ignoredUserId: profileId }] },
+        { session },
+      );
+      await Shortlist.deleteMany(
+        { $or: [{ userId: profileId }, { shortlistedUserId: profileId }] },
+        { session },
+      );
+      await ContactView.deleteMany(
+        { $or: [{ viewerId: profileId }, { viewedProfileId: profileId }] },
+        { session },
+      );
+      await ProfileVisit.deleteMany(
+        {
+          $or: [
+            { viewerProfileId: profileId },
+            { visitedProfileId: profileId },
+          ],
+        },
+        { session },
+      );
+      await ProfileReport.deleteMany(
+        { $or: [{ reporterId: profileId }, { reportedProfileId: profileId }] },
+        { session },
+      );
+
+      // Payments are kept on purpose (tax and Razorpay records)
+
+      await Profile.deleteOne({ _id: profileId }, { session });
+
+      await session.commitTransaction();
+    } catch (error) {
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      await session.endSession();
+    }
+
+    // Delete images only after the database changes are committed
+    await Promise.allSettled(
+      imageUrls.map(async (url) => {
+        const publicId = getCloudinaryPublicId(url);
+        if (!publicId) return;
+        try {
+          await cloudinary.uploader.destroy(publicId);
+        } catch (err) {
+          console.error('Cloudinary delete failed:', publicId, err);
+        }
+      }),
+    );
+
     return res.status(200).json({
       success: true,
-      message: 'Profile deleted successfully.',
+      message: 'Profile and all associated data deleted permanently.',
     });
   } catch (error: any) {
-    res.status(400).json({
+    return res.status(400).json({
       success: false,
       message: error.message,
     });
   }
 };
-
 export const getRecommendedMatches = async (req: Request, res: Response) => {
   try {
     // Logged in user's profile
